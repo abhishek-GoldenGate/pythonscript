@@ -9,14 +9,19 @@ check_special_hours.py
 5. For each Store ID, puts it into the curl command's "sourceIds" (JSON body
    or URL query parameter), runs it, and checks that every "specialHours"
    in the JSON response is exactly equal to the expected value.
-6. Prints the Store IDs whose specialHours do not match.
+   Whitespace/indentation may differ, but structure, keys, value types,
+   number formats and date/time strings must be identical (to the second).
+6. Prints the Store IDs whose specialHours do not match and saves them to
+   mismatched_source_ids_<timestamp>.csv next to this script.
 
 Requires: pip install openpyxl   (and curl on PATH, built into Windows 10+)
 Usage:    python check_special_hours.py [optional_path_to_excel]
 """
 
+import csv
 import json
 import re
+from datetime import datetime
 import shlex
 import shutil
 import subprocess
@@ -210,22 +215,104 @@ def find_special_hours(data, found=None) -> list:
     return found
 
 
-def values_equal(actual, expected) -> bool:
-    """Strict equality: same structure, same types, same values."""
+class RawNumber:
+    """A JSON number kept exactly as written, so 900 != 900.0 != 9e2."""
+    __slots__ = ("text",)
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def __eq__(self, other):
+        return isinstance(other, RawNumber) and self.text == other.text
+
+    def __hash__(self):
+        return hash(self.text)
+
+
+def parse_json_exact(text: str):
+    """Parse JSON ignoring whitespace/indentation, but keeping number formats."""
+    return json.loads(text, parse_int=RawNumber, parse_float=RawNumber)
+
+
+def type_name(v) -> str:
+    return {RawNumber: "number", str: "string", bool: "boolean", list: "array",
+            dict: "object", type(None): "null"}.get(type(v), type(v).__name__)
+
+
+def find_difference(actual, expected, path="specialHours"):
+    """
+    Return a description of the first difference, or None if identical.
+    Strings (dates/times such as "09:00:00") must match character for
+    character, so "09:00" vs "09:00:00" or "09:00:00" vs "09:00:01" fail.
+    """
     if type(actual) is not type(expected):
-        return False
+        return (f"{path}: expected {type_name(expected)} {short(expected)}, "
+                f"got {type_name(actual)} {short(actual)}")
     if isinstance(expected, dict):
-        return actual.keys() == expected.keys() and all(
-            values_equal(actual[k], expected[k]) for k in expected)
+        missing = [k for k in expected if k not in actual]
+        extra = [k for k in actual if k not in expected]
+        if missing:
+            return f"{path}: missing key(s) {missing}"
+        if extra:
+            return f"{path}: unexpected key(s) {extra}"
+        for k in expected:
+            diff = find_difference(actual[k], expected[k], f"{path}.{k}")
+            if diff:
+                return diff
+        return None
     if isinstance(expected, list):
-        return len(actual) == len(expected) and all(
-            values_equal(a, e) for a, e in zip(actual, expected))
-    return actual == expected
+        if len(actual) != len(expected):
+            return f"{path}: expected {len(expected)} item(s), got {len(actual)}"
+        for i, (a, e) in enumerate(zip(actual, expected)):
+            diff = find_difference(a, e, f"{path}[{i}]")
+            if diff:
+                return diff
+        return None
+    if actual != expected:
+        return f"{path}: expected {short(expected)}, got {short(actual)}"
+    return None
+
+
+def to_display(value):
+    if isinstance(value, RawNumber):
+        return json.loads(value.text)
+    if isinstance(value, dict):
+        return {k: to_display(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [to_display(v) for v in value]
+    return value
 
 
 def short(value, limit=300) -> str:
-    s = json.dumps(value, ensure_ascii=False)
+    s = json.dumps(to_display(value), ensure_ascii=False)
     return s if len(s) <= limit else s[:limit] + "..."
+
+
+def read_expected_special_hours():
+    """Ask until valid JSON is entered. Accepts an optional "specialHours": prefix."""
+    while True:
+        text = read_multiline('\nEnter the expected "specialHours" value (JSON):').strip()
+        # Accept:  [...]   /   "specialHours": [...]   /   {"specialHours": [...]}
+        text = re.sub(r'^"?specialHours"?\s*:\s*', "", text).rstrip(",").strip()
+        try:
+            value = parse_json_exact(text)
+        except json.JSONDecodeError as e:
+            print(f"Invalid JSON ({e}). Please enter it again.")
+            continue
+        if isinstance(value, dict) and list(value) == ["specialHours"]:
+            value = value["specialHours"]
+        return value
+
+
+def write_mismatch_csv(mismatched) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = Path(__file__).resolve().parent / f"mismatched_source_ids_{stamp}.csv"
+    with out.open("w", newline="", encoding="utf-8-sig") as f:   # BOM so Excel opens it cleanly
+        writer = csv.writer(f)
+        writer.writerow(["sourceId", "reason", "actual specialHours"])
+        for sid, reason, actual in mismatched:
+            writer.writerow([sid, reason, actual])
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -241,21 +328,18 @@ def main():
     if not contains_source_ids(curl_args):
         sys.exit("The curl command does not contain a 'sourceIds' attribute.")
 
-    expected_text = read_multiline('\nEnter the expected "specialHours" value (JSON):')
-    try:
-        expected = json.loads(expected_text)
-    except json.JSONDecodeError:
-        # Not valid JSON: treat the input as a plain string value
-        expected = expected_text.strip()
-        print(f"Note: input is not valid JSON, comparing as text: {short(expected)}")
+    expected = read_expected_special_hours()
+    print(f"Expected specialHours: {short(expected, limit=1000)}")
 
-    mismatched = []   # (store_id, reason)
+    mismatched = []   # (store_id, reason, actual specialHours)
     print(f"\nChecking {len(store_ids)} store(s)...\n")
     for i, sid in enumerate(store_ids, 1):
         prefix = f"[{i}/{len(store_ids)}] sourceIds={sid}:"
+        actual = ""
+        body = ""
         try:
             body = run_curl(substitute_source_id(curl_args, sid))
-            data = json.loads(body)
+            data = parse_json_exact(body)
         except subprocess.TimeoutExpired:
             reason = "request timed out"
         except RuntimeError as e:
@@ -264,23 +348,29 @@ def main():
             reason = f"response is not JSON: {body[:200]!r}"
         else:
             values = find_special_hours(data)
+            reason = None
             if not values:
                 reason = "no 'specialHours' attribute in response"
-            else:
-                bad = [v for v in values if not values_equal(v, expected)]
-                reason = (f"specialHours = {short(bad[0])}" if bad else None)
+            for v in values:
+                diff = find_difference(v, expected)
+                if diff:
+                    reason = diff
+                    actual = json.dumps(to_display(v), ensure_ascii=False)
+                    break
 
         if reason:
             print(f"{prefix} MISMATCH ({reason})")
-            mismatched.append((sid, reason))
+            mismatched.append((sid, reason, actual))
         else:
             print(f"{prefix} OK")
 
     print("\n" + "=" * 60)
     if mismatched:
         print(f"{len(mismatched)} sourceIds DID NOT MATCH the expected specialHours:")
-        for sid, reason in mismatched:
+        for sid, reason, _ in mismatched:
             print(f"  {sid}    -> {reason}")
+        csv_path = write_mismatch_csv(mismatched)
+        print(f"\nMismatched IDs saved to: {csv_path}")
     else:
         print("All sourceIds matched the expected specialHours.")
     print("=" * 60)
