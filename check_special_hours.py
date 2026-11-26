@@ -4,6 +4,7 @@ check_special_hours.py
 1. Finds the Excel file (.xlsx / .xlsm) sitting next to this script.
 2. Scans every sheet for the "Store Status" and "Store ID" columns and keeps
    the Store IDs of rows whose Store Status is "Live".
+   Then asks for the Excel row number to start from (Enter = row 1).
 3. Asks for a curl command (paste it, then press Enter on an empty line).
 4. Asks for the expected "specialHours" value (paste it, then empty line).
 5. For each Store ID, puts it into the curl command's "sourceIds" (JSON body
@@ -81,9 +82,10 @@ def cell_to_id(value) -> str:
     return str(value).strip()
 
 
-def get_live_store_ids(excel_path: Path) -> list[str]:
+def get_live_store_ids(excel_path: Path) -> list[tuple[int, str]]:
+    """Return (excel_row_number, store_id) for every 'Live' row."""
     wb = load_workbook(excel_path, read_only=True, data_only=True)
-    store_ids: list[str] = []
+    store_ids: list[tuple[int, str]] = []
     found_headers = False
 
     for ws in wb.worksheets:
@@ -108,14 +110,15 @@ def get_live_store_ids(excel_path: Path) -> list[str]:
 
         found_headers = True
         sheet_count = 0
-        for row in rows:  # continues after the header row
+        # continues after the header row; row_no is the Excel row number
+        for row_no, row in enumerate(rows, start=rows_seen + 1):
             if row is None or len(row) <= max(status_col, id_col):
                 continue
             if normalize(row[status_col]) == LIVE_VALUE:
                 sid = row[id_col]
                 if sid is None or str(sid).strip() == "":
                     continue
-                store_ids.append(cell_to_id(sid))
+                store_ids.append((row_no, cell_to_id(sid)))
                 sheet_count += 1
         print(f"  Sheet '{ws.title}': {sheet_count} 'Live' store(s) found.")
 
@@ -309,10 +312,24 @@ def write_mismatch_csv(mismatched) -> Path:
     out = Path(__file__).resolve().parent / f"mismatched_source_ids_{stamp}.csv"
     with out.open("w", newline="", encoding="utf-8-sig") as f:   # BOM so Excel opens it cleanly
         writer = csv.writer(f)
-        writer.writerow(["sourceId", "reason", "actual specialHours"])
-        for sid, reason, actual in mismatched:
-            writer.writerow([sid, reason, actual])
+        writer.writerow(["excelRow", "sourceId", "reason", "actual specialHours"])
+        for row_no, sid, reason, actual in mismatched:
+            writer.writerow([row_no, sid, reason, actual])
     return out
+
+
+def read_start_row() -> int:
+    """Excel row number to start from; just Enter means row 1 (everything)."""
+    while True:
+        try:
+            text = input("Enter Excel row number to start from (press Enter for 1): ").strip()
+        except EOFError:
+            return 1
+        if text == "":
+            return 1
+        if text.isdigit() and int(text) >= 1:
+            return int(text)
+        print("Please enter a positive whole number, or just press Enter.")
 
 
 # --------------------------------------------------------------------------- #
@@ -324,6 +341,12 @@ def main():
         sys.exit("No rows with Store Status = 'Live' were found.")
     print(f"Excel scanned successfully. {len(store_ids)} Live Store ID(s) found.\n")
 
+    start_row = read_start_row()
+    store_ids = [(r, sid) for r, sid in store_ids if r >= start_row]
+    if not store_ids:
+        sys.exit(f"No 'Live' rows found at or after Excel row {start_row}.")
+    print(f"Starting from Excel row {start_row}: {len(store_ids)} Live store(s) to check.\n")
+
     curl_args = parse_curl(read_multiline("Enter the curl command:"))
     if not contains_source_ids(curl_args):
         sys.exit("The curl command does not contain a 'sourceIds' attribute.")
@@ -333,8 +356,8 @@ def main():
 
     mismatched = []   # (store_id, reason, actual specialHours)
     print(f"\nChecking {len(store_ids)} store(s)...\n")
-    for i, sid in enumerate(store_ids, 1):
-        prefix = f"[{i}/{len(store_ids)}] sourceIds={sid}:"
+    for i, (row_no, sid) in enumerate(store_ids, 1):
+        prefix = f"[{i}/{len(store_ids)}] row {row_no}, sourceIds={sid}:"
         actual = ""
         body = ""
         try:
@@ -360,15 +383,15 @@ def main():
 
         if reason:
             print(f"{prefix} MISMATCH ({reason})")
-            mismatched.append((sid, reason, actual))
+            mismatched.append((row_no, sid, reason, actual))
         else:
             print(f"{prefix} OK")
 
     print("\n" + "=" * 60)
     if mismatched:
         print(f"{len(mismatched)} sourceIds DID NOT MATCH the expected specialHours:")
-        for sid, reason, _ in mismatched:
-            print(f"  {sid}    -> {reason}")
+        for row_no, sid, reason, _ in mismatched:
+            print(f"  row {row_no}: {sid}    -> {reason}")
         csv_path = write_mismatch_csv(mismatched)
         print(f"\nMismatched IDs saved to: {csv_path}")
     else:
