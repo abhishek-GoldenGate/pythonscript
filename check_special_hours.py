@@ -6,15 +6,16 @@ check_special_hours.py
    the Store IDs of rows whose Store Status is "Live".
    Then asks for the Excel row number to start from (Enter = row 1).
 3. Asks for a curl command (paste it, then press Enter on an empty line).
-4. Asks for the expected "specialHours" value (paste it, then empty line).
-5. For each Store ID, puts it into the curl command's "sourceIds" (JSON body
-   or URL query parameter), runs it, and checks that every "specialHours"
-   in the JSON response is exactly equal to the expected value.
-   Whitespace/indentation may differ, but structure, keys, value types,
-   number formats and date/time strings must be identical (to the second).
-   Exact duplicate entries inside the specialHours array count once, so
-   [{A}, {A}] matches [{A}].
-6. Prints the Store IDs whose specialHours do not match and saves them to
+4. For each Store ID, puts it into the curl command's "sourceIds" (JSON body
+   or URL query parameter), runs it, and checks the "specialHours" array:
+     - it must exist and must not be empty
+     - at least one entry must have date == EXPECTED_DATE and
+       operatingHours == {startTime: EXPECTED_START_TIME, endTime: EXPECTED_END_TIME}
+     - every OTHER entry dated in the same year (2026) must also have exactly
+       those startTime/endTime values
+     - entries from other years (e.g. 2024, 2025) are ignored
+   Spacing/indentation don't matter; values, types and formats must be exact.
+5. Prints the Store IDs that fail and saves them to
    mismatched_source_ids_<timestamp>.csv next to this script.
 
 Requires: pip install openpyxl   (and curl on PATH, built into Windows 10+)
@@ -41,6 +42,12 @@ ID_HEADER = "store id"
 LIVE_VALUE = "live"
 HEADER_SEARCH_ROWS = 20      # how many top rows to search for the header row
 CURL_TIMEOUT_SECONDS = 60
+
+# ---- Expected specialHours values (edit these when the requirement changes) ----
+EXPECTED_DATE = "2026-11-26T00:00:00.001Z"
+EXPECTED_START_TIME = "08.00.00"
+EXPECTED_END_TIME = "08.01.00"
+CHECK_YEAR = EXPECTED_DATE[:4]   # entries of this year must have the expected times
 
 
 # --------------------------------------------------------------------------- #
@@ -278,31 +285,36 @@ def find_difference(actual, expected, path="specialHours"):
     return None
 
 
-def freeze(value):
-    """Hashable, type-aware fingerprint of a parsed JSON value."""
-    if isinstance(value, RawNumber):
-        return ("num", value.text)
-    if isinstance(value, dict):
-        return ("obj", tuple(sorted((k, freeze(v)) for k, v in value.items())))
-    if isinstance(value, list):
-        return ("arr", tuple(freeze(v) for v in value))
-    return (type(value).__name__, value)
-
-
-def dedupe(value):
-    """
-    If value is an array, drop exact duplicate entries (keeping first
-    occurrence order). [{A}, {A}] -> [{A}]. Returns (value, removed_count).
-    """
+def check_special_hours(value):
+    """Return None if this specialHours value passes, else the reason it fails."""
     if not isinstance(value, list):
-        return value, 0
-    seen, unique = set(), []
-    for item in value:
-        key = freeze(item)
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-    return unique, len(value) - len(unique)
+        return f"specialHours is not an array: {short(value)}"
+    if not value:
+        return "specialHours is an empty array []"
+
+    expected_hours = {"startTime": EXPECTED_START_TIME, "endTime": EXPECTED_END_TIME}
+    found_expected_date = False
+
+    for i, entry in enumerate(value):
+        path = f"specialHours[{i}]"
+        if not isinstance(entry, dict):
+            return f"{path} is not an object: {short(entry)}"
+        date = entry.get("date")
+        if not isinstance(date, str) or not date.startswith(CHECK_YEAR):
+            continue    # other years (2024, 2025, ...) are ignored
+
+        if "operatingHours" not in entry:
+            return f"{path} (date {date}): missing 'operatingHours'"
+        diff = find_difference(entry["operatingHours"], expected_hours,
+                               f"{path}.operatingHours")
+        if diff:
+            return f"{diff} (date {date})"
+        if date == EXPECTED_DATE:
+            found_expected_date = True
+
+    if not found_expected_date:
+        return f"no entry with date {EXPECTED_DATE!r} found"
+    return None
 
 
 def to_display(value):
@@ -318,26 +330,6 @@ def to_display(value):
 def short(value, limit=300) -> str:
     s = json.dumps(to_display(value), ensure_ascii=False)
     return s if len(s) <= limit else s[:limit] + "..."
-
-
-def read_expected_special_hours():
-    """Ask until valid JSON is entered. Accepts an optional "specialHours": prefix."""
-    while True:
-        text = read_multiline('\nEnter the expected "specialHours" value (JSON):').strip()
-        # Accept:  [...]   /   "specialHours": [...]   /   {"specialHours": [...]}
-        text = re.sub(r'^"?specialHours"?\s*:\s*', "", text).rstrip(",").strip()
-        try:
-            value = parse_json_exact(text)
-        except json.JSONDecodeError as e:
-            print(f"Invalid JSON ({e}). Please enter it again.")
-            continue
-        if isinstance(value, dict) and list(value) == ["specialHours"]:
-            value = value["specialHours"]
-        value, removed = dedupe(value)
-        if removed:
-            print(f"Note: {removed} duplicate entr{'y' if removed == 1 else 'ies'} "
-                  "in your expected value ignored.")
-        return value
 
 
 def write_mismatch_csv(mismatched) -> Path:
@@ -384,10 +376,10 @@ def main():
     if not contains_source_ids(curl_args):
         sys.exit("The curl command does not contain a 'sourceIds' attribute.")
 
-    expected = read_expected_special_hours()
-    print(f"Expected specialHours: {short(expected, limit=1000)}")
+    print(f"\nExpected: specialHours entry with date {EXPECTED_DATE}, "
+          f"startTime {EXPECTED_START_TIME}, endTime {EXPECTED_END_TIME}")
 
-    mismatched = []   # (store_id, reason, actual specialHours)
+    mismatched = []   # (row_no, store_id, reason, actual specialHours)
     print(f"\nChecking {len(store_ids)} store(s)...\n")
     for i, (row_no, sid) in enumerate(store_ids, 1):
         prefix = f"[{i}/{len(store_ids)}] row {row_no}, sourceIds={sid}:"
@@ -405,16 +397,11 @@ def main():
         else:
             values = find_special_hours(data)
             reason = None
-            dup_count = 0
             if not values:
                 reason = "no 'specialHours' attribute in response"
             for v in values:
-                # Duplicated entries in the array count once: [{A},{A}] == [{A}]
-                unique_v, removed = dedupe(v)
-                dup_count += removed
-                diff = find_difference(unique_v, expected)
-                if diff:
-                    reason = diff
+                reason = check_special_hours(v)
+                if reason:
                     actual = json.dumps(to_display(v), ensure_ascii=False)
                     break
 
@@ -422,8 +409,7 @@ def main():
             print(f"{prefix} MISMATCH ({reason})")
             mismatched.append((row_no, sid, reason, actual))
         else:
-            note = f" ({dup_count} duplicate entries ignored)" if dup_count else ""
-            print(f"{prefix} OK{note}")
+            print(f"{prefix} OK")
 
     print("\n" + "=" * 60)
     if mismatched:
