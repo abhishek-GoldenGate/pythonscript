@@ -11,11 +11,11 @@ check_special_hours.py
    "partnerIds" (JSON body or URL query parameter), runs curl, and checks
    the "specialHours" array:
      - it must exist and must not be empty
-     - at least one entry must have date == EXPECTED_DATE and
+     - at least one entry, at ANY position in the array, must have
+       date == EXPECTED_DATE and
        operatingHours == {startTime: EXPECTED_START_TIME, endTime: EXPECTED_END_TIME}
-     - every OTHER entry dated in the same year (2026) must also have exactly
-       those startTime/endTime values
-     - entries from other years (e.g. 2024, 2025) are ignored
+       (date and times must be in the SAME object)
+     - all other entries (other dates, other years such as 2027) are ignored
    Spacing/indentation don't matter; values, types and formats must be exact.
 5. Prints the Store IDs that fail and saves them to
    mismatched_source_ids_<timestamp>.csv next to this script.
@@ -52,7 +52,6 @@ CURL_TIMEOUT_SECONDS = 60
 EXPECTED_DATE = "2026-11-26T00:00:00.001Z"
 EXPECTED_START_TIME = "08.00.00"
 EXPECTED_END_TIME = "08.01.00"
-CHECK_YEAR = EXPECTED_DATE[:4]   # entries of this year must have the expected times
 
 
 # --------------------------------------------------------------------------- #
@@ -373,36 +372,50 @@ def find_difference(actual, expected, path="specialHours"):
     return None
 
 
+EXPECTED_HOURS = {"startTime": EXPECTED_START_TIME, "endTime": EXPECTED_END_TIME}
+
+
 def check_special_hours(value):
-    """Return None if this specialHours value passes, else the reason it fails."""
+    """
+    Return None if this specialHours value passes, else the reason it fails.
+
+    Passes when ANY entry (at any index: first, middle or last) has
+    date == EXPECTED_DATE AND operatingHours == EXPECTED_HOURS, both in the
+    SAME object. Every other entry (other dates, other years, other shapes)
+    is ignored.
+    """
     if not isinstance(value, list):
         return f"specialHours is not an array: {short(value)}"
     if not value:
         return "specialHours is an empty array []"
 
-    expected_hours = {"startTime": EXPECTED_START_TIME, "endTime": EXPECTED_END_TIME}
-    found_expected_date = False
+    date_matches_wrong_time = []   # right date, wrong/missing operatingHours
+    time_matches_wrong_date = []   # right times, but on a different date
 
     for i, entry in enumerate(value):
-        path = f"specialHours[{i}]"
         if not isinstance(entry, dict):
-            return f"{path} is not an object: {short(entry)}"
+            continue                     # not an object -> cannot be the one we need
+        path = f"specialHours[{i}]"
         date = entry.get("date")
-        if not isinstance(date, str) or not date.startswith(CHECK_YEAR):
-            continue    # other years (2024, 2025, ...) are ignored
+        hours = entry.get("operatingHours")
+        hours_diff = (f"{path}: missing 'operatingHours'" if "operatingHours" not in entry
+                      else find_difference(hours, EXPECTED_HOURS, f"{path}.operatingHours"))
 
-        if "operatingHours" not in entry:
-            return f"{path} (date {date}): missing 'operatingHours'"
-        diff = find_difference(entry["operatingHours"], expected_hours,
-                               f"{path}.operatingHours")
-        if diff:
-            return f"{diff} (date {date})"
         if date == EXPECTED_DATE:
-            found_expected_date = True
+            if hours_diff is None:
+                return None              # required object found -> OK
+            date_matches_wrong_time.append(hours_diff)
+        elif hours_diff is None:
+            time_matches_wrong_date.append(f"{path}.date = {short(date)}")
 
-    if not found_expected_date:
-        return f"no entry with date {EXPECTED_DATE!r} found"
-    return None
+    if date_matches_wrong_time:
+        return (f"entry with date {EXPECTED_DATE} found but times are wrong: "
+                f"{'; '.join(date_matches_wrong_time)}")
+    if time_matches_wrong_date:
+        return (f"times {EXPECTED_START_TIME}-{EXPECTED_END_TIME} found but on a different "
+                f"date ({'; '.join(time_matches_wrong_date)}), expected {EXPECTED_DATE}")
+    return (f"no entry with date {EXPECTED_DATE} and times "
+            f"{EXPECTED_START_TIME}-{EXPECTED_END_TIME} found")
 
 
 def to_display(value):
