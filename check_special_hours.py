@@ -12,6 +12,8 @@ check_special_hours.py
    in the JSON response is exactly equal to the expected value.
    Whitespace/indentation may differ, but structure, keys, value types,
    number formats and date/time strings must be identical (to the second).
+   Exact duplicate entries inside the specialHours array count once, so
+   [{A}, {A}] matches [{A}].
 6. Prints the Store IDs whose specialHours do not match and saves them to
    mismatched_source_ids_<timestamp>.csv next to this script.
 
@@ -276,6 +278,33 @@ def find_difference(actual, expected, path="specialHours"):
     return None
 
 
+def freeze(value):
+    """Hashable, type-aware fingerprint of a parsed JSON value."""
+    if isinstance(value, RawNumber):
+        return ("num", value.text)
+    if isinstance(value, dict):
+        return ("obj", tuple(sorted((k, freeze(v)) for k, v in value.items())))
+    if isinstance(value, list):
+        return ("arr", tuple(freeze(v) for v in value))
+    return (type(value).__name__, value)
+
+
+def dedupe(value):
+    """
+    If value is an array, drop exact duplicate entries (keeping first
+    occurrence order). [{A}, {A}] -> [{A}]. Returns (value, removed_count).
+    """
+    if not isinstance(value, list):
+        return value, 0
+    seen, unique = set(), []
+    for item in value:
+        key = freeze(item)
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique, len(value) - len(unique)
+
+
 def to_display(value):
     if isinstance(value, RawNumber):
         return json.loads(value.text)
@@ -304,6 +333,10 @@ def read_expected_special_hours():
             continue
         if isinstance(value, dict) and list(value) == ["specialHours"]:
             value = value["specialHours"]
+        value, removed = dedupe(value)
+        if removed:
+            print(f"Note: {removed} duplicate entr{'y' if removed == 1 else 'ies'} "
+                  "in your expected value ignored.")
         return value
 
 
@@ -372,10 +405,14 @@ def main():
         else:
             values = find_special_hours(data)
             reason = None
+            dup_count = 0
             if not values:
                 reason = "no 'specialHours' attribute in response"
             for v in values:
-                diff = find_difference(v, expected)
+                # Duplicated entries in the array count once: [{A},{A}] == [{A}]
+                unique_v, removed = dedupe(v)
+                dup_count += removed
+                diff = find_difference(unique_v, expected)
                 if diff:
                     reason = diff
                     actual = json.dumps(to_display(v), ensure_ascii=False)
@@ -385,7 +422,8 @@ def main():
             print(f"{prefix} MISMATCH ({reason})")
             mismatched.append((row_no, sid, reason, actual))
         else:
-            print(f"{prefix} OK")
+            note = f" ({dup_count} duplicate entries ignored)" if dup_count else ""
+            print(f"{prefix} OK{note}")
 
     print("\n" + "=" * 60)
     if mismatched:
